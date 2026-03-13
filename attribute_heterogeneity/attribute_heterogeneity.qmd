@@ -1,0 +1,335 @@
+---
+title: "Attribute Name Heterogeneity: cBioPortal & curatedMetagenomicData"
+author: Sehyun Oh
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+format:
+    html:
+        fontsize: 14px
+        toc: true
+        toc-depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, collapse = TRUE)
+```
+
+```{r libs, echo=FALSE}
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(readr)
+    library(ggplot2)
+    library(knitr)
+    library(kableExtra)
+})
+```
+
+## Overview
+
+A single biological concept — *age at sample collection*, *sex*, *disease diagnosis* — is
+routinely recorded under dozens of different column names across studies in the same database.
+This document quantifies that naming heterogeneity for two large biomedical data resources:
+
+- **cBioPortal** – cancer genomics (clinical metadata aggregated from hundreds of studies)
+- **curatedMetagenomicData (cMD)** – human microbiome (manually curated from public shotgun studies)
+
+For each harmonized concept we count the number of **distinct original column names** that
+contributors used to encode the same information. These counts come directly from the
+merging schemas built during the OmicsMLRepo curation process.
+
+---
+
+## Load merging schemas
+
+```{r load}
+extDir <- "~/OmicsMLRepo/OmicsMLRepoData/inst/extdata"
+
+cbio_ms <- read_csv(file.path(extDir, "cBioPortal_merging_schema.csv"),
+                    show_col_types = FALSE)
+cmd_ms  <- read_csv(file.path(extDir, "cMD_merging_schema.csv"),
+                    show_col_types = FALSE)
+```
+
+---
+
+## Parse attribute name counts
+
+```{r parse}
+# Helper: assign a broad semantic category to a curated field name
+assign_category <- function(field) {
+    case_when(
+        grepl("^age", field)                                                    ~ "Age",
+        grepl("^treatment|antibiotics|dietary", field)                          ~ "Treatment",
+        grepl("cancer|disease|tumor|vital|staging|subtype|specimen|sample_type|body_site|feces|disease_response|hla|biomarker|bmi", field) ~ "Disease / Biology",
+        grepl("ancestry|sex|country|location|westernized|smoker|obgyn|neonatal|fmt|pmid|ncbi|dna_extract|probing", field) ~ "Demographics / Sample",
+        TRUE                                                                    ~ "Other"
+    )
+}
+
+# ── cBioPortal ──────────────────────────────────────────────────────────────
+cbio_dat <- cbio_ms %>%
+    # exclude rows where no original field exists (newly introduced concepts)
+    filter(!is.na(original_field), !is.na(original_field_num)) %>%
+    mutate(
+        # take the first curated field name when multiple are joined with ";"
+        concept      = gsub(";.*", "", curated_field),
+        n_original   = as.integer(original_field_num),
+        dataset      = "cBioPortal",
+        category     = assign_category(concept)
+    ) %>%
+    select(concept, n_original, dataset, category)
+
+# ── curatedMetagenomicData ───────────────────────────────────────────────────
+cmd_dat <- cmd_ms %>%
+    filter(!is.na(original_field), original_field != "NA",
+           !is.na(original_field_num)) %>%
+    mutate(
+        concept      = gsub(";.*", "", curated_field),
+        n_original   = as.integer(original_field_num),
+        dataset      = "cMD",
+        category     = assign_category(concept)
+    ) %>%
+    select(concept, n_original, dataset, category)
+
+combined <- bind_rows(cbio_dat, cmd_dat)
+```
+
+---
+
+## Summary table {#sec-table}
+
+```{r summary_table}
+summary_tbl <- combined %>%
+    group_by(dataset) %>%
+    summarise(
+        `Harmonized concepts`            = n(),
+        `Total original attribute names` = sum(n_original),
+        `Median names / concept`         = median(n_original),
+        `Max names / concept`            = max(n_original),
+        `Concepts with ≥ 10 names`       = sum(n_original >= 10),
+        .groups = "drop"
+    )
+
+kable(summary_tbl,
+      caption = "**Table 1.** Attribute name heterogeneity across two biomedical databases.
+      Each 'original attribute name' is a distinct column header found across
+      contributing studies before harmonization.",
+      align = c("l", rep("r", ncol(summary_tbl) - 1))) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+## Figure: Distribution of attribute name synonyms {#sec-figure}
+
+```{r heterogeneity_fig, fig.width=9, fig.height=6.5, dpi=300}
+## ── colour palette ───────────────────────────────────────────────────────
+pal <- c(
+    "Age"                   = "#E64B35",
+    "Treatment"             = "#F39B7F",
+    "Disease / Biology"     = "#4DBBD5",
+    "Demographics / Sample" = "#00A087",
+    "Other"                 = "#B09C85"
+)
+
+## ── build plot data ───────────────────────────────────────────────────────
+# Create a unique label per concept-dataset combination, then set its factor
+# level order by n_original so each facet panel is sorted independently.
+plot_dat <- combined %>%
+    # unique key: concept + dataset avoids level collisions across facets
+    mutate(key = paste0(concept, " [", dataset, "]")) %>%
+    arrange(dataset, n_original) %>%
+    mutate(key = factor(key, levels = unique(key)))
+
+## ── lollipop / Cleveland dot plot ────────────────────────────────────────
+p <- ggplot(plot_dat, aes(x = n_original, y = key, colour = category)) +
+    geom_segment(aes(xend = 0, yend = key),
+                 linewidth = 0.5, alpha = 0.45) +
+    geom_point(size = 2.8) +
+    scale_x_log10(
+        breaks = c(1, 3, 10, 30, 100, 300),
+        labels = c("1", "3", "10", "30", "100", "300")
+    ) +
+    # strip " [cBioPortal]" / " [cMD]" from y-axis tick labels
+    scale_y_discrete(labels = function(x) sub(" \\[.*\\]$", "", x)) +
+    scale_colour_manual(values = pal, name = "Semantic category") +
+    facet_wrap(~ dataset, scales = "free_y", ncol = 2) +
+    theme_bw(base_size = 11) +
+    labs(
+        title    = "Naming heterogeneity of metadata attributes in cBioPortal and curatedMetagenomicData",
+        subtitle = paste0(
+            "Each dot = one harmonized concept; x-axis = # of distinct original column names ",
+            "(log\u2081\u2080 scale).\n",
+            "Multiple contributing studies use different column names for the same biological concept."
+        ),
+        x = "# of distinct original attribute names (log\u2081\u2080 scale)",
+        y = NULL
+    ) +
+    theme(
+        axis.text.y        = element_text(size = 7.5),
+        strip.text         = element_text(face = "bold", size = 11),
+        legend.position    = "bottom",
+        legend.title       = element_text(size = 9),
+        legend.text        = element_text(size = 8),
+        plot.title         = element_text(face = "bold", size = 11),
+        plot.subtitle      = element_text(size = 9, colour = "grey40"),
+        panel.grid.major.y = element_line(linetype = "dotted", colour = "grey85")
+    )
+
+print(p)
+```
+
+```{r save_fig}
+ggsave("figures/attribute_heterogeneity.png",
+       plot = p, width = 9, height = 6.5, dpi = 600)
+```
+
+---
+
+## Key callout examples {#sec-callout}
+
+```{r age_example}
+# cBioPortal age-related fields
+age_cbio <- cbio_ms %>%
+    filter(grepl("^age_", curated_field),
+           !is.na(original_field_num)) %>%
+    select(curated_field, original_field_num, original_field)
+
+# How many distinct original names encode "age" across all age-related curated fields?
+total_age_names_cbio <- sum(as.integer(age_cbio$original_field_num), na.rm = TRUE)
+
+cat("cBioPortal – age-related curated fields:", nrow(age_cbio), "\n")
+cat("cBioPortal – total original 'age' column names:", total_age_names_cbio, "\n\n")
+
+# A sample of original age names from age_at_procurement (most heterogeneous)
+age_proc_names <- age_cbio %>%
+    filter(curated_field == "age_at_procurement") %>%
+    pull(original_field) %>%
+    strsplit(";") %>%
+    unlist()
+
+cat("Example: original column names for 'age at procurement' in cBioPortal:\n")
+cat(paste(" •", head(age_proc_names, 12), collapse = "\n"), "\n")
+```
+
+```{r treatment_example}
+trt_cbio <- cbio_ms %>%
+    filter(grepl("^treatment", curated_field),
+           !is.na(original_field_num)) %>%
+    select(curated_field, original_field_num) %>%
+    mutate(original_field_num = as.integer(original_field_num))
+
+cat("cBioPortal – treatment-related harmonized fields:", nrow(trt_cbio), "\n")
+cat("cBioPortal – total original 'treatment' column names:",
+    sum(trt_cbio$original_field_num), "\n")
+cat("\nBreakdown by treatment sub-concept:\n")
+print(trt_cbio)
+```
+
+---
+
+## Interpretation
+
+The table and figure above demonstrate that **naming inconsistency is pervasive and
+substantial** even within a single curated database:
+
+- In **cBioPortal**, the 30 harmonized clinical concepts are represented by a total of
+  **`r sum(cbio_dat$n_original)` distinct original column names** across contributing studies.
+  A single concept such as *age* is encoded under
+  **`r total_age_names_cbio` different column names** (e.g., `AGE`, `AGE_IN_DAYS`,
+  `AGE_AT_PROCUREMENT`, `AGE_AT_SEQ_REPORT`, `PATIENT_AGE_AT_DIAGNOSIS`, …), and
+  *treatment type* alone attracts **`r cbio_dat %>% filter(concept=='treatment_type') %>% pull(n_original)` names**.
+
+- In **curatedMetagenomicData**, the naming is more standardised — the median concept has
+  just **`r median(cmd_dat$n_original)` original name(s)** — yet *biomarker* still
+  aggregates **`r cmd_dat %>% filter(concept=='biomarker') %>% pull(n_original)` original
+  column names** from the individual study data tables.
+
+This heterogeneity motivates an AI/ML-assisted approach to metadata harmonization that can
+learn the mapping from heterogeneous raw attribute names to a consistent, ontology-grounded
+schema at scale.
+
+---
+
+## For the review article
+
+cBioPortal only, with treatment_* attributes excluded.
+
+```{r review_data}
+cbio_no_trt <- cbio_dat %>%
+    filter(!grepl("^treatment", concept))
+```
+
+### Summary table (cBioPortal, no treatment)
+
+```{r review_table}
+review_tbl <- cbio_no_trt %>%
+    summarise(
+        Dataset                          = "cBioPortal (non-treatment)",
+        `Harmonized concepts`            = n(),
+        `Total original attribute names` = sum(n_original),
+        `Median names / concept`         = median(n_original),
+        `Max names / concept`            = max(n_original),
+        `Concepts with ≥ 10 names`       = sum(n_original >= 10)
+    )
+
+kable(review_tbl,
+      caption = "**Table 2.** Attribute name heterogeneity in cBioPortal (treatment attributes excluded).",
+      align = c("l", rep("r", ncol(review_tbl) - 1))) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Figure (cBioPortal, no treatment) {#sec-review-fig}
+
+```{r review_fig, fig.width=8, fig.height=5.5, dpi=300}
+review_plot_dat <- cbio_no_trt %>%
+    filter(n_original > 1) %>%
+    arrange(n_original) %>%
+    mutate(concept = factor(concept, levels = unique(concept)))
+
+p_review <- ggplot(review_plot_dat,
+                   aes(x = n_original, y = concept, colour = category)) +
+    geom_segment(aes(xend = 0, yend = concept),
+                 linewidth = 0.5, alpha = 0.45) +
+    geom_point(size = 3) +
+    scale_x_log10(
+        breaks = c(1, 3, 10, 30, 100),
+        labels = c("1", "3", "10", "30", "100"),
+        limits = c(1, NA)
+    ) +
+    scale_colour_manual(values = pal, name = "Semantic category") +
+    theme_bw(base_size = 11) +
+    labs(
+        title    = "Attribute name heterogeneity – cBioPortal",
+        subtitle = paste0(
+            "Each dot = one harmonized concept (treatment attributes excluded).\n",
+            "x-axis = # of distinct original column names (log\u2081\u2080 scale)."
+        ),
+        x = "# of distinct original attribute names (log\u2081\u2080 scale)",
+        y = NULL
+    ) +
+    theme(
+        axis.text.y        = element_text(size = 9),
+        legend.position    = "bottom",
+        legend.title       = element_text(size = 9),
+        legend.text        = element_text(size = 8),
+        plot.title         = element_text(face = "bold", size = 11),
+        plot.subtitle      = element_text(size = 9, colour = "grey40"),
+        panel.grid.major.y = element_line(linetype = "dotted", colour = "grey85")
+    )
+
+print(p_review)
+```
+
+```{r review_fig_save}
+ggsave("figures/attribute_heterogeneity_cbio_no_trt.png",
+       plot = p_review, width = 6.5, height = 5.5, dpi = 600)
+```
+
+---
+
+## Session Info
+<details>
+```{r session_info}
+sessionInfo()
+```
+</details>
