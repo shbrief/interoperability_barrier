@@ -1,0 +1,286 @@
+---
+title: "Mapping-Type Visualisation"
+subtitle: "Many-to-one & many-to-many bipartite plots"
+output: html_document
+params:
+  csv_path: "cBioPortal_disease_cancer_type_map.csv"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = TRUE,
+  warning = FALSE,
+  fig.width  = 12,
+  fig.height = 8,
+  dpi = 150
+)
+```
+
+## 1 — Load libraries
+
+```{r libraries}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+```
+
+## 2 — Read the curation map
+
+Set `csv_path` to any map CSV. You can change it here or pass it via the
+`params` YAML header.
+
+```{r read-data}
+csv_path <- params$csv_path
+
+# If the path doesn't exist as-is, look relative to the Rmd location
+if (!file.exists(csv_path)) {
+    csv_path <- file.path(
+        dirname(knitr::current_input(dir = TRUE)),
+        params$csv_path
+    )
+}
+stopifnot(file.exists(csv_path))
+
+message("Reading → ", csv_path)
+dat <- read.csv(csv_path, stringsAsFactors = FALSE)
+```
+
+## 3 — Detect columns & delimiters
+
+```{r detect}
+col_names <- names(dat)
+
+# Auto-detect the curated ontology column
+if ("curated_ontology" %in% col_names) {
+    curated_col <- "curated_ontology"
+} else {
+    candidates <- grep("[.:]curated_ontology$", col_names, value = TRUE)
+    preferred  <- grep("^sample_type[.:]curated_ontology$", candidates,
+                       value = TRUE)
+    if (length(preferred) > 0) {
+        curated_col <- preferred[1]
+    } else if (length(candidates) > 0) {
+        curated_col <- candidates[1]
+    } else {
+        stop("No curated_ontology column found in: ", csv_path)
+    }
+}
+message("Curated column: ", curated_col)
+
+# Normalise to two columns
+dat_raw <- dat %>%
+    select(original_value, curated_ontology = all_of(curated_col)) %>%
+    filter(!is.na(curated_ontology), curated_ontology != "")
+
+# Auto-detect delimiter
+vals <- dat_raw$curated_ontology
+if (any(grepl("<;>", vals, fixed = TRUE))) {
+    delim <- "<;>"
+} else if (any(grepl(";", vals, fixed = TRUE))) {
+    delim <- ";"
+} else {
+    delim <- NULL
+}
+if (!is.null(delim)) message("Detected delimiter: '", delim, "'") else message("No delimiter detected")
+```
+
+## 4 — Expand & deduplicate
+
+```{r expand}
+if (!is.null(delim)) {
+    delim_regex <- gsub("([.|()\\^{}+$*?\\[\\]])", "\\\\\\1", delim)
+    dat_long <- dat_raw %>%
+        mutate(row_id = row_number()) %>%
+        separate_rows(curated_ontology, sep = delim_regex) %>%
+        mutate(curated_ontology = trimws(curated_ontology)) %>%
+        filter(curated_ontology != "") %>%
+        select(original_value, curated_ontology) %>%
+        distinct()
+} else {
+    dat_long <- dat_raw %>%
+        mutate(curated_ontology = trimws(curated_ontology)) %>%
+        select(original_value, curated_ontology) %>%
+        distinct()
+}
+
+fwd <- dat_long %>%
+    group_by(original_value) %>%
+    summarise(n_curated = n_distinct(curated_ontology), .groups = "drop")
+
+message("Unique original values: ", nrow(fwd))
+message("  → map to 1 curated term: ", sum(fwd$n_curated == 1))
+message("  → map to >1 curated term: ", sum(fwd$n_curated > 1))
+```
+
+## 5 — Identify many-to-one mappings
+
+Multiple `original_value` entries that each map to the **same single**
+`curated_ontology` term.
+
+```{r many-to-one-data}
+pure_one <- fwd %>% filter(n_curated == 1) %>% pull(original_value)
+
+m2o_edges <- dat_long %>%
+    filter(original_value %in% pure_one) %>%
+    select(original_value, curated_ontology) %>%
+    distinct()
+
+m2o_groups <- m2o_edges %>%
+    group_by(curated_ontology) %>%
+    filter(n() > 1) %>%
+    mutate(group_size = n()) %>%
+    ungroup()
+
+top3 <- m2o_groups %>%
+    distinct(curated_ontology, group_size) %>%
+    slice_max(group_size, n = 3) %>%
+    pull(curated_ontology)
+
+m2o_sel <- m2o_groups %>% filter(curated_ontology %in% top3)
+
+message("Many-to-one groups found: ",
+        n_distinct(m2o_groups$curated_ontology),
+        " (showing top 3)")
+```
+
+## 6 — Identify many-to-many mappings
+
+`original_value` entries that map to **more than one** curated term.
+
+```{r many-to-many-data}
+m2m_originals <- fwd %>% filter(n_curated > 1) %>% pull(original_value)
+
+m2m_edges_all <- dat_long %>%
+    filter(original_value %in% m2m_originals) %>%
+    select(original_value, curated_ontology) %>%
+    distinct()
+
+m2m_originals_sel <- m2m_edges_all %>%
+    group_by(original_value) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    slice_max(n, n = 6) %>%
+    pull(original_value)
+
+m2m_sel <- m2m_edges_all %>% filter(original_value %in% m2m_originals_sel)
+
+message("Many-to-many originals found: ", length(m2m_originals),
+        " (showing top 6)")
+```
+
+## 7 — Define the plotting function
+
+```{r plot-function}
+pal_left  <- "#2b7bba"
+pal_right <- "#e85d04"
+
+edge_pal <- c("#6a4c93", "#1982c4", "#8ac926", "#ff595e", "#ff924c",
+              "#56cfe1", "#457b9d", "#e63946", "#2a9d8f", "#f4a261")
+
+bipartite_plot <- function(edges, title,
+                           colour_by = c("right", "left"),
+                           left_title  = "original_value",
+                           right_title = "curated_ontology") {
+
+    colour_by <- match.arg(colour_by)
+
+    left_labs  <- unique(edges$original_value)
+    right_labs <- unique(edges$curated_ontology)
+    n_left     <- length(left_labs)
+    n_right    <- length(right_labs)
+
+    left_df <- data.frame(
+        label = left_labs, x = 0,
+        y = seq(1, 0, length.out = n_left),
+        stringsAsFactors = FALSE
+    )
+    right_df <- data.frame(
+        label = right_labs, x = 1,
+        y = seq(1, 0, length.out = n_right),
+        stringsAsFactors = FALSE
+    )
+
+    seg_df <- edges %>%
+        left_join(left_df  %>% rename(x1 = x, y1 = y),
+                  by = c("original_value"  = "label")) %>%
+        left_join(right_df %>% rename(x2 = x, y2 = y),
+                  by = c("curated_ontology" = "label"))
+
+    if (colour_by == "right") {
+        seg_df$colour_group <- seg_df$curated_ontology
+    } else {
+        seg_df$colour_group <- seg_df$original_value
+    }
+    colour_levels <- unique(seg_df$colour_group)
+    colour_map <- setNames(
+        rep_len(edge_pal, length(colour_levels)),
+        colour_levels
+    )
+
+    ggplot() +
+        geom_curve(
+            data = seg_df,
+            aes(x = x1, y = y1, xend = x2, yend = y2,
+                colour = colour_group),
+            curvature = 0.25, linewidth = 0.8, alpha = 0.6,
+            show.legend = FALSE
+        ) +
+        scale_colour_manual(values = colour_map) +
+        geom_label(
+            data = left_df,
+            aes(x = x - 0.02, y = y, label = label),
+            hjust = 1, size = 2.4, fontface = "bold",
+            colour = "white", fill = pal_left,
+            linewidth = 0,
+            label.r = unit(0.25, "lines"),
+            label.padding = unit(0.2, "lines")
+        ) +
+        geom_label(
+            data = right_df,
+            aes(x = x + 0.02, y = y, label = label),
+            hjust = 0, size = 2.4, fontface = "bold",
+            colour = "white", fill = pal_right,
+            linewidth = 0,
+            label.r = unit(0.25, "lines"),
+            label.padding = unit(0.2, "lines")
+        ) +
+        annotate("text", x = 0, y = 1.10, label = left_title,
+                 fontface = "bold", size = 3.5, colour = "#444444") +
+        annotate("text", x = 1, y = 1.10, label = right_title,
+                 fontface = "bold", size = 3.5, colour = "#444444") +
+        labs(title = title) +
+        coord_cartesian(xlim = c(-0.75, 1.75), ylim = c(-0.06, 1.20),
+                        clip = "off") +
+        theme_void(base_family = "sans") +
+        theme(
+            plot.title      = element_text(face = "bold", hjust = 0.5,
+                                           size = 15, margin = margin(b = 6)),
+            plot.background = element_rect(fill = "#fafafa", colour = NA),
+            plot.margin     = margin(12, 12, 12, 12)
+        )
+}
+```
+
+## 8 — Many-to-One plot
+
+```{r plot-m2o, fig.width=12, fig.height=15}
+if (nrow(m2o_sel) > 0) {
+    bipartite_plot(m2o_sel, "Many-to-One Mapping", colour_by = "right")
+} else {
+    message("No many-to-one mappings to display.")
+}
+```
+
+## 9 — Many-to-Many plot
+
+```{r plot-m2m, fig.width=12, fig.height=8}
+if (nrow(m2m_sel) > 0) {
+    bipartite_plot(m2m_sel, "Many-to-Many Mapping", colour_by = "left")
+} else {
+    message("No many-to-many mappings to display.")
+}
+```
+
+---
+
+*Generated from `plot_mapping_types.Rmd`*
